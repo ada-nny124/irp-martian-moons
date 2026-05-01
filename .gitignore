@@ -1,0 +1,15 @@
+# Simulation data and snapshots
+snapshots/
+*.hdf5
+
+# Machine learning datasets and summaries
+*.csv
+
+# Generated plots
+plots/
+plots_debug/
+*.png
+
+# Python caches
+__pycache__/
+*.py[cod]
