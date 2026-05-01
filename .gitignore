@@ -1,0 +1,3 @@
+*.hdf5
+snapshots/
+ml_training_data_90ks.csv
