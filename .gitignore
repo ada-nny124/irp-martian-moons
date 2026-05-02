@@ -1,18 +1,11 @@
 *.hdf5
-snapshots/
 ml_training_data_90ks.csv
 # Simulation data and snapshots
 snapshots/
 *.hdf5
 
 # Machine learning datasets and summaries
-*.csv
 .pkl
-
-# Generated plots
-plots/
-plots_debug/
-*.png
 
 # Python caches
 __pycache__/
