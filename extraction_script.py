@@ -7,33 +7,41 @@ import pandas as pd
 G = 6.67430e-11  
 M_MARS = 6.4171e23  
 R_MARS = 3.3895e6  
+UNBOUND_ID = 2147483647  # INT_MAX used as the 'no group' flag
 
 OUTPUT_DIR = "extraction_output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def get_group_ids(h5_file):
-    """Searches for Group IDs in common output paths."""
-    for path in ["PartType0/GroupIDs", "PartType0/FOFGroupIDs", "GroupIDs"]:
-        if path in h5_file: return h5_file[path][()]
-    raise KeyError("GroupIDs not found.")
+    """Targets the confirmed FOFGroupIDs path."""
+    if "PartType0/FOFGroupIDs" in h5_file:
+        return h5_file["PartType0/FOFGroupIDs"][()]
+    raise KeyError("FOFGroupIDs not found. Run h5ls on the fof file.")
 
 def get_particle_masses(h5_file):
-    """Extracts masses from dataset or Header MassTable."""
+    """Robustly extracts masses and applies unit conversion."""
+    # Attempt to get unit mass from the file attributes
+    u_m = 1.0
+    if "Units" in h5_file:
+        u_m = float(h5_file["Units"].attrs.get("Unit mass in cgs (U_M)", 1.0)) * 1e-3 # to kg
+    
     if "PartType0/Masses" in h5_file:
-        return h5_file["PartType0/Masses"][()]
+        return h5_file["PartType0/Masses"][()] * u_m
+    
+    # Fallback to MassTable
     mass_table = h5_file["Header"].attrs["MassTable"]
     num_particles = h5_file["Header"].attrs["NumPart_ThisFile"][0]
-    # Use index 0 for PartType0 particles
-    return np.full(num_particles, mass_table[0])
+    return np.full(num_particles, mass_table[0]) * u_m
 
 def calculate_orbital_elements(pos_vec, vel_vec):
-    """Calculates keplerian elements for a CoM state vector."""
     r_mag = np.linalg.norm(pos_vec)
     v_mag = np.linalg.norm(vel_vec)
     if r_mag == 0: return [0]*5
+    
     energy = (v_mag**2 / 2.0) - (G * M_MARS / r_mag)
     h_vec = np.cross(pos_vec, vel_vec)
     h_mag = np.linalg.norm(h_vec)
+    
     a = -G * M_MARS / (2.0 * energy) if abs(energy) > 1e-10 else np.inf
     e_vec = (np.cross(vel_vec, h_vec) / (G * M_MARS)) - (pos_vec / r_mag)
     e = np.linalg.norm(e_vec)
@@ -46,13 +54,16 @@ def process_simulation_set(directory):
     
     for init_name in init_files:
         sim_id = init_name.replace("init_", "").replace(".hdf5", "")
-        final_file, fof_file = f"{sim_id}_90000.hdf5", f"{sim_id}_90000_fof_0.0020_0000.hdf5"
+        final_file = f"{sim_id}_90000.hdf5"
+        fof_file = f"{sim_id}_90000_fof_0.0020_0000.hdf5"
+        
         if not os.path.exists(os.path.join(directory, final_file)): continue
 
         try:
             with h5py.File(os.path.join(directory, init_name), "r") as f_init:
                 u_l = float(f_init["Units"].attrs["Unit length in cgs (U_L)"]) * 1e-2
-                u_v = u_l / float(f_init["Units"].attrs["Unit time in cgs (U_t)"])
+                u_t = float(f_init["Units"].attrs["Unit time in cgs (U_t)"])
+                u_v = u_l / u_t
                 n_particles = f_init["Header"].attrs["NumPart_Total"][0]
                 
             with h5py.File(os.path.join(directory, final_file), "r") as f_final, \
@@ -66,23 +77,33 @@ def process_simulation_set(directory):
                 
                 df = pd.DataFrame({"id": group_ids, "m": masses, "x": pos[:,0], "y": pos[:,1], "z": pos[:,2], "vx": vel[:,0], "vy": vel[:,1], "vz": vel[:,2]})
                 
-                # Precise Center of Mass calculation with zero-mass check
+                # CRITICAL FILTER: Exclude the UNBOUND_ID (2147483647)
+                bound_df = df[(df["id"] >= 0) & (df["id"] < UNBOUND_ID)]
+                
                 def calc_com(g):
                     total_m = g["m"].sum()
-                    if total_m <= 0: return None # Skip invalid fragments
+                    if total_m <= 0: return None
                     return pd.Series({
                         "f_mass": total_m,
                         "cx": (g["x"]*g["m"]).sum()/total_m, "cy": (g["y"]*g["m"]).sum()/total_m, "cz": (g["z"]*g["m"]).sum()/total_m,
                         "cvx": (g["vx"]*g["m"]).sum()/total_m, "cvy": (g["vy"]*g["m"]).sum()/total_m, "cvz": (g["vz"]*g["m"]).sum()/total_m
                     })
 
-                frags = df[df["id"] >= 0].groupby("id").apply(calc_com, include_groups=False).dropna().reset_index()
+                frags = bound_df.groupby("id").apply(calc_com, include_groups=False).dropna().reset_index()
 
                 for _, f in frags.iterrows():
                     a, e, i, rp, ra = calculate_orbital_elements(np.array([f.cx, f.cy, f.cz]), np.array([f.cvx, f.cvy, f.cvz]))
-                    catalog_list.append({"sim_id": sim_id, "fragment_id": int(f.id), "mass_kg": f.f_mass, "a": a, "e": e, "i": i, "rp_Rm": rp/R_MARS, "ra_Rm": ra/R_MARS})
+                    catalog_list.append({
+                        "sim_id": sim_id, "fragment_id": int(f.id), "mass_kg": f.f_mass, 
+                        "a": a, "e": e, "i": i, "rp_Rm": rp/R_MARS, "ra_Rm": ra/R_MARS
+                    })
 
-                summary_list.append({"sim_id": sim_id, "n_particles": int(n_particles), "bound_mass_kg": df[df["id"]>=0]["m"].sum(), "max_frag_kg": frags["f_mass"].max() if not frags.empty else 0, "frag_count": len(frags)})
+                summary_list.append({
+                    "sim_id": sim_id, "n_particles": int(n_particles), 
+                    "bound_mass_kg": bound_df["m"].sum(), 
+                    "max_frag_kg": frags["f_mass"].max() if not frags.empty else 0, 
+                    "frag_count": len(frags)
+                })
 
         except Exception as e: print(f"Error {sim_id}: {e}")
 
